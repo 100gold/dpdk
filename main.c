@@ -21,6 +21,7 @@
 #include <rte_ip.h>
 #include <rte_tcp.h>
 #include <rte_hash.h>
+#include <rte_mempool.h>
 
 
 #define MAX_PACKETS 32
@@ -99,7 +100,8 @@ size_t g_http_part2_size;
 const char* g_http_part3 = "</body></html>";
 size_t g_http_part3_size;
 
-struct rte_mempool *g_packet_mbuf_pool = NULL;
+struct rte_mempool* g_packet_mbuf_pool = NULL;
+struct rte_mempool* g_tcp_state_pool = NULL;
 struct ether_addr g_mac_addr;
 struct rte_hash* g_clients = NULL;
 struct tcp_packet_template g_tcp_packet_template;
@@ -332,8 +334,11 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		{
 			TRACE;
 			struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
-			//need memory pool!
-			state = (struct tcp_state*)malloc(sizeof(struct tcp_state));
+			if (rte_mempool_get(g_tcp_state_pool, (void**)&state) < 0)
+			{
+				ERROR("tcp state alloc fail");
+				return;
+			}
 
 			memcpy(&state->tcp_template, &g_tcp_packet_template, sizeof(g_tcp_packet_template));
 			memcpy(&state->tcp_template.eth.d_addr, &eth_header->s_addr, 6);
@@ -380,7 +385,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 			else
 			{
 				ERROR("can't add connection to table");
-				free(state);
+				rte_mempool_put(g_tcp_state_pool, state);
 			}
 		}
 		return;
@@ -445,9 +450,9 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 	{
 		TRACE;
 		rte_hash_del_key(g_clients, key);
+		rte_mempool_put(g_tcp_state_pool, state);
 	}
-
-	if ((tcp_header->tcp_flags & 0x01) != 0) // FIN
+	else if ((tcp_header->tcp_flags & 0x01) != 0) // FIN
 	{
 		TRACE;
 		struct tcp_hdr* new_tcp_header;
@@ -468,6 +473,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 			ERROR("rte_pktmbuf_alloc, tcp fin");
 		}
 		rte_hash_del_key(g_clients, key);
+		rte_mempool_put(g_tcp_state_pool, state);
 	}
 }
 
@@ -686,6 +692,13 @@ int main(int argc, char** argv)
 	if (g_packet_mbuf_pool == NULL)
 	{
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+	}
+
+	g_tcp_state_pool = rte_mempool_create("tcp_state_pool", 1023, sizeof(struct tcp_state),
+		0, 0, NULL, NULL, NULL, NULL, rte_socket_id(), 0);
+	if (g_tcp_state_pool == NULL)
+	{
+		rte_exit(EXIT_FAILURE, "Cannot init tcp_state pool\n");
 	}
 
 	struct rte_hash_parameters hash_params = {
