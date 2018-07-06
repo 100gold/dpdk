@@ -25,12 +25,13 @@
 
 
 #define MAX_PACKETS 32
-#define MY_IP_ADDRESS 0x1c2da8c0
+#define MY_IP_ADDRESS 0x0a041eac
 #define TX_WINDOW_SIZE 0x7fff
 
 #define ERROR(_S_) printf("Error at %s:%i ,  %s\n", __FUNCTION__, __LINE__, _S_)
 //#define TRACE printf("trace at %s:%i\n", __FUNCTION__, __LINE__);
 #define TRACE ;
+//#define ERROR(_S_) ;
 
 
 #pragma pack(push)
@@ -88,6 +89,7 @@ struct tcp_state
 	uint32_t remote_seq;
 	uint32_t my_seq_start;
 	uint32_t my_seq_sent;
+	int fin_sent;
 
 	struct http_state http;
 };
@@ -105,6 +107,8 @@ struct rte_mempool* g_tcp_state_pool = NULL;
 struct ether_addr g_mac_addr;
 struct rte_hash* g_clients = NULL;
 struct tcp_packet_template g_tcp_packet_template;
+
+uint64_t g_total_packet_send = 0;
 
 
 static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, struct tcp_hdr** tcp_header)
@@ -270,8 +274,10 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 					{
 						tcp_header->rx_win = TX_WINDOW_SIZE;
 						tcp_header->sent_seq = htonl(state->my_seq_sent);
-						state->my_seq_sent += total_data_size;
+						state->my_seq_sent += total_data_size + 1; //+1 for FIN
 						tcp_header->recv_ack = htonl(state->remote_seq + data_size);
+						tcp_header->tcp_flags = 0x11;
+						state->fin_sent = 1;
 
 						char* new_data = (char*)tcp_header + sizeof(struct tcp_hdr);
 						memcpy(new_data, g_http_part1, g_http_part1_size);
@@ -286,7 +292,14 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 
 						// need to offload
 						tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
-						rte_eth_tx_burst(0, 0, &packet, 1);
+						if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+						{
+							ERROR("tx buffer full (http body)");
+						}
+						else
+						{
+							g_total_packet_send++;
+						}
 					}
 					else
 					{
@@ -322,6 +335,7 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 }
 
 
+
 static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct tcp_key* key, void* data, size_t data_size)
 {
 	TRACE;
@@ -332,6 +346,12 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		TRACE;
 		if ((tcp_header->tcp_flags & 0x2) != 0) // SYN
 		{
+			/*
+				printf("packet: ");
+				for(int x=0; x<rte_pktmbuf_data_len(m); ++x)
+					printf("%02X ", (uint32_t)(((uint8_t*)eth_header)[x]));
+				printf("\n");
+				*/
 			TRACE;
 			struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
 			if (rte_mempool_get(g_tcp_state_pool, (void**)&state) < 0)
@@ -350,6 +370,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 			#pragma GCC diagnostic ignored "-Wpointer-to-int-cast"
 			state->my_seq_start = (uint32_t)state; // not very secure.
 			#pragma GCC diagnostic pop
+			state->fin_sent = 0;
 
 			state->http.state = HTTP_START;
 			state->http.request_url_size = 0;
@@ -375,7 +396,14 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 
 					// need to offload
 					new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-					rte_eth_tx_burst(0, 0, &packet, 1);
+					if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+					{
+						ERROR("tx buffer full (synack)");
+					}
+					else
+					{
+						g_total_packet_send++;
+					}
 				}
 				else
 				{
@@ -387,6 +415,10 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				ERROR("can't add connection to table");
 				rte_mempool_put(g_tcp_state_pool, state);
 			}
+		}
+		else
+		{
+			ERROR("lost connection");
 		}
 		return;
 	}
@@ -416,12 +448,13 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 	if (data_size > 0)
 	{
 		TRACE;
-		if (state->remote_seq == htonl(tcp_header->sent_seq))
+		uint32_t packet_seq = htonl(tcp_header->sent_seq);
+		if (state->remote_seq == packet_seq)
 		{
 			feed_http(data, data_size, state);
 			state->remote_seq += data_size;
 		}
-		else if (state->remote_seq-1 == htonl(tcp_header->sent_seq)) // keepalive
+		else if (state->remote_seq-1 == packet_seq) // keepalive
 		{
 			struct tcp_hdr* new_tcp_header;
 			struct rte_mbuf* packet = build_packet(state, 0, &new_tcp_header);
@@ -433,7 +466,14 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 
 				// need to offload
 				new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-				rte_eth_tx_burst(0, 0, &packet, 1);
+				if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+				{
+					ERROR("tx buffer full (ack)");
+				}
+				else
+				{
+					g_total_packet_send++;
+				}
 			}
 			else
 			{
@@ -449,31 +489,55 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 	if ((tcp_header->tcp_flags & 0x04) != 0) // RST
 	{
 		TRACE;
-		rte_hash_del_key(g_clients, key);
-		rte_mempool_put(g_tcp_state_pool, state);
+		if (rte_hash_del_key(g_clients, key) < 0)
+		{
+			ERROR("can't delete key");
+		}
+		else
+		{
+			rte_mempool_put(g_tcp_state_pool, state);
+		}
 	}
 	else if ((tcp_header->tcp_flags & 0x01) != 0) // FIN
 	{
-		TRACE;
 		struct tcp_hdr* new_tcp_header;
 		struct rte_mbuf* packet = build_packet(state, 0, &new_tcp_header);
+		TRACE;
 		if (packet != NULL)
 		{
 			new_tcp_header->rx_win = TX_WINDOW_SIZE;
 			new_tcp_header->sent_seq = htonl(state->my_seq_sent);
 			new_tcp_header->recv_ack = htonl(state->remote_seq + 1);
-			new_tcp_header->tcp_flags = 0x11;
+			if (!state->fin_sent)
+			{
+				TRACE;
+				new_tcp_header->tcp_flags = 0x11;
+				// !@#$ the last ack
+			}
 
 			// need to offload
 			new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-			rte_eth_tx_burst(0, 0, &packet, 1);
+			if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+			{
+				ERROR("tx buffer full (finack)");
+			}
+			else
+			{
+				g_total_packet_send++;
+			}
 		}
 		else
 		{
-			ERROR("rte_pktmbuf_alloc, tcp fin");
+			ERROR("rte_pktmbuf_alloc, tcp fin ack");
 		}
-		rte_hash_del_key(g_clients, key);
-		rte_mempool_put(g_tcp_state_pool, state);
+		if (rte_hash_del_key(g_clients, key) < 0)
+		{
+			ERROR("can't delete key");
+		}
+		else
+		{
+			rte_mempool_put(g_tcp_state_pool, state);
+		}
 	}
 }
 
@@ -514,15 +578,23 @@ static void send_arp_response(const struct arp* arp_in)
 static int lcore_hello(__attribute__((unused)) void* arg)
 {
 	struct rte_mbuf *packets[MAX_PACKETS];
+	uint64_t last_statistic_send_print = 0;
+	uint64_t last_statistic_read_print = 0;
+	uint64_t total_packet_read = 0;
 	while (1)
 	{
 		unsigned packet_count = rte_eth_rx_burst(0, 0, packets, MAX_PACKETS);
 
-		if (packet_count == 0)
+		total_packet_read += packet_count;
+		if (last_statistic_read_print + 20000 < total_packet_read)
 		{
-			//???
-			rte_delay_ms(100);
-			continue;
+			printf("total packets read: %lu\n", total_packet_read);
+			last_statistic_read_print = total_packet_read;
+		}
+		if (last_statistic_send_print + 20000 < g_total_packet_send)
+		{
+			printf("total packets send: %lu\n", g_total_packet_send);
+			last_statistic_send_print = g_total_packet_send;
 		}
 
 		for (unsigned j=0; j<packet_count; ++j)
@@ -687,14 +759,14 @@ int main(int argc, char** argv)
 	g_http_part3_size = strlen(g_http_part3);
 
 	/* create the mbuf pool */
-	g_packet_mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", 1023, 32,
+	g_packet_mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", 131071, 32,
 		0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (g_packet_mbuf_pool == NULL)
 	{
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 	}
 
-	g_tcp_state_pool = rte_mempool_create("tcp_state_pool", 1023, sizeof(struct tcp_state),
+	g_tcp_state_pool = rte_mempool_create("tcp_state_pool", 131071, sizeof(struct tcp_state),
 		0, 0, NULL, NULL, NULL, NULL, rte_socket_id(), 0);
 	if (g_tcp_state_pool == NULL)
 	{
@@ -771,14 +843,14 @@ int main(int argc, char** argv)
 
 	/* init one RX queue */
 	fflush(stdout);
-	ret = rte_eth_rx_queue_setup(0, 0, 128, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
+	ret = rte_eth_rx_queue_setup(0, 0, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
 	if (ret < 0)
 	{
 		rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
 	}
 	/* init one TX queue on each port */
 	fflush(stdout);
-	ret = rte_eth_tx_queue_setup(0, 0, 512, rte_eth_dev_socket_id(0), NULL);
+	ret = rte_eth_tx_queue_setup(0, 0, 1024, rte_eth_dev_socket_id(0), NULL);
 	if (ret < 0)
 	{
 		rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
