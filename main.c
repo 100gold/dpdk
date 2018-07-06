@@ -24,7 +24,8 @@
 #include <rte_mempool.h>
 
 
-#define MAX_PACKETS 32
+#define MAX_PACKETS 2048
+#define RXTX_QUEUE_COUNT 8
 #define MY_IP_ADDRESS 0x0a041eac
 #define TX_WINDOW_SIZE 0x7fff
 
@@ -102,6 +103,7 @@ size_t g_http_part2_size;
 const char* g_http_part3 = "</body></html>";
 size_t g_http_part3_size;
 
+uint16_t g_tx_current_queue = 0;
 struct rte_mempool* g_packet_mbuf_pool = NULL;
 struct rte_mempool* g_tcp_state_pool = NULL;
 struct ether_addr g_mac_addr;
@@ -292,7 +294,7 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 
 						// need to offload
 						tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
-						if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+						if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 						{
 							ERROR("tx buffer full (http body)");
 						}
@@ -396,7 +398,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 
 					// need to offload
 					new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-					if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+					if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 					{
 						ERROR("tx buffer full (synack)");
 					}
@@ -466,7 +468,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 
 				// need to offload
 				new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-				if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+				if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 				{
 					ERROR("tx buffer full (ack)");
 				}
@@ -517,7 +519,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 
 			// need to offload
 			new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-			if (rte_eth_tx_burst(0, 0, &packet, 1) != 1)
+			if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 			{
 				ERROR("tx buffer full (finack)");
 			}
@@ -581,9 +583,10 @@ static int lcore_hello(__attribute__((unused)) void* arg)
 	uint64_t last_statistic_send_print = 0;
 	uint64_t last_statistic_read_print = 0;
 	uint64_t total_packet_read = 0;
+	uint16_t rx_current_queue = 0;
 	while (1)
 	{
-		unsigned packet_count = rte_eth_rx_burst(0, 0, packets, MAX_PACKETS);
+		unsigned packet_count = rte_eth_rx_burst(0, (++rx_current_queue) % RXTX_QUEUE_COUNT, packets, MAX_PACKETS);
 
 		total_packet_read += packet_count;
 		if (last_statistic_read_print + 20000 < total_packet_read)
@@ -774,7 +777,7 @@ int main(int argc, char** argv)
 	}
 
 	struct rte_hash_parameters hash_params = {
-		.entries = 32768,
+		.entries = 64536,
 		.key_len = sizeof(struct tcp_key),
 		.socket_id = rte_socket_id(),
 		.hash_func_init_val = 0,
@@ -810,7 +813,7 @@ int main(int argc, char** argv)
 			.mq_mode = ETH_MQ_TX_NONE,
 		},
 	};
-	ret = rte_eth_dev_configure(0, 1, 1, &port_conf);
+	ret = rte_eth_dev_configure(0, RXTX_QUEUE_COUNT, RXTX_QUEUE_COUNT, &port_conf);
 	if (ret < 0)
 	{
 		rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d\n", ret);
@@ -841,19 +844,19 @@ int main(int argc, char** argv)
 	g_tcp_packet_template.tcp.data_off = 0x50; // no options
 	g_tcp_packet_template.tcp.tcp_flags = 0x10; // ACK flag
 
-	/* init one RX queue */
 	fflush(stdout);
-	ret = rte_eth_rx_queue_setup(0, 0, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
-	if (ret < 0)
+	for (uint16_t j=0; j<RXTX_QUEUE_COUNT; ++j)
 	{
-		rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
-	}
-	/* init one TX queue on each port */
-	fflush(stdout);
-	ret = rte_eth_tx_queue_setup(0, 0, 1024, rte_eth_dev_socket_id(0), NULL);
-	if (ret < 0)
-	{
-		rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
+		ret = rte_eth_rx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
+		if (ret < 0)
+		{
+			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
+		}
+		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL);
+		if (ret < 0)
+		{
+			rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
+		}
 	}
 	rte_eth_promiscuous_enable(0);
 
