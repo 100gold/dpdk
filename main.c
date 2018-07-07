@@ -26,6 +26,8 @@
 
 #define ENABLE_CSUM_OFFLOAD
 #define COUNT_ALL_PACKETS
+#define RST_IF_GOES_WRONG
+#define KEEPALIVE
 
 #define MAX_PACKETS 2048
 #define RXTX_QUEUE_COUNT 8
@@ -98,8 +100,11 @@ struct tcp_state
 	struct http_state http;
 };
 
-
+#ifdef KEEPALIVE
+const char* g_http_part1 = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nConnection: Keep-Alive\r\nContent-Length: ";
+#else
 const char* g_http_part1 = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: ";
+#endif
 size_t g_http_part1_size;
 const char* g_http_part2 = "\r\n\r\n<html><title>dpdk server</title><body>Requested url is ";
 size_t g_http_part2_size;
@@ -115,6 +120,21 @@ struct tcp_packet_template g_tcp_packet_template;
 #ifdef COUNT_ALL_PACKETS
 uint64_t g_total_packet_send = 0;
 #endif
+#ifdef RST_IF_GOES_WRONG
+int g_has_reaction = 0;
+#endif
+
+
+static void dump_mbuf(struct rte_mbuf* m)
+{
+	struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
+	printf("packet: ");
+	for(int x=0; x<rte_pktmbuf_data_len(m); ++x)
+	{
+		printf("%02X ", (uint32_t)(((uint8_t*)eth_header)[x]));
+	}
+	printf("\n");
+}
 
 
 static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, struct tcp_hdr** tcp_header)
@@ -145,6 +165,31 @@ static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, 
 
 	return m;
 }
+
+
+static void send_packet(struct tcp_hdr* tcp_header, struct rte_mbuf* packet)
+{
+#ifdef ENABLE_CSUM_OFFLOAD
+	tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
+#else
+	tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
+#endif
+	if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
+	{
+		ERROR("tx buffer full");
+	}
+	else
+	{
+#ifdef COUNT_ALL_PACKETS
+		g_total_packet_send++;
+#endif
+	}
+
+#ifdef RST_IF_GOES_WRONG
+	g_has_reaction = 1;
+#endif
+}
+
 
 
 static void feed_http(void* data, size_t data_size, struct tcp_state* state)
@@ -285,10 +330,14 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 					{
 						tcp_header->rx_win = TX_WINDOW_SIZE;
 						tcp_header->sent_seq = htonl(state->my_seq_sent);
-						state->my_seq_sent += total_data_size + 1; //+1 for FIN
 						tcp_header->recv_ack = htonl(state->remote_seq + data_size);
+#ifdef KEEPALIVE
+						state->my_seq_sent += total_data_size;
+#else
+						state->my_seq_sent += total_data_size + 1; //+1 for FIN
 						tcp_header->tcp_flags = 0x11;
 						state->fin_sent = 1;
+#endif
 
 						char* new_data = (char*)tcp_header + sizeof(struct tcp_hdr);
 						memcpy(new_data, g_http_part1, g_http_part1_size);
@@ -301,21 +350,7 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 						new_data += http->request_url_size;
 						memcpy(new_data, g_http_part3, g_http_part3_size);
 
-#ifdef ENABLE_CSUM_OFFLOAD
-						tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
-#else
-						tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
-#endif
-						if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
-						{
-							ERROR("tx buffer full (http body)");
-						}
-						else
-						{
-#ifdef COUNT_ALL_PACKETS
-							g_total_packet_send++;
-#endif
-						}
+						send_packet(tcp_header, packet);
 					}
 					else
 					{
@@ -362,12 +397,6 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		TRACE;
 		if ((tcp_header->tcp_flags & 0x2) != 0) // SYN
 		{
-			/*
-				printf("packet: ");
-				for(int x=0; x<rte_pktmbuf_data_len(m); ++x)
-					printf("%02X ", (uint32_t)(((uint8_t*)eth_header)[x]));
-				printf("\n");
-				*/
 			TRACE;
 			struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
 			if (rte_mempool_get(g_tcp_state_pool, (void**)&state) < 0)
@@ -410,21 +439,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 					memcpy((uint8_t*)new_tcp_header + sizeof(struct tcp_hdr), options, 12);
 					new_tcp_header->data_off = 0x80;
 
-#ifdef ENABLE_CSUM_OFFLOAD
-					new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
-#else
-					new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-#endif
-					if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
-					{
-						ERROR("tx buffer full (synack)");
-					}
-					else
-					{
-#ifdef COUNT_ALL_PACKETS
-						g_total_packet_send++;
-#endif
-					}
+					send_packet(new_tcp_header, packet);
 				}
 				else
 				{
@@ -444,6 +459,20 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		return;
 	}
 
+	if ((tcp_header->tcp_flags & 0x2) != 0) // SYN retransmit
+	{
+		//not thread safe! only one core used
+		if (rte_hash_del_key(g_clients, key) < 0)
+		{
+			ERROR("can't delete key");
+		}
+		else
+		{
+			rte_mempool_put(g_tcp_state_pool, state);
+			return process_tcp(m, tcp_header, key, data, data_size);
+		}
+	}
+
 	if ((tcp_header->tcp_flags & 0x10) != 0) // ACK
 	{
 		TRACE;
@@ -458,6 +487,9 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else if (ack_delta <= my_max_ack_delta)
 		{
+#ifdef RST_IF_GOES_WRONG
+			g_has_reaction = 1;
+#endif
 			state->my_seq_start += ack_delta;
 		}
 		else
@@ -485,21 +517,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				new_tcp_header->sent_seq = htonl(state->my_seq_sent);
 				new_tcp_header->recv_ack = htonl(state->remote_seq);
 
-#ifdef ENABLE_CSUM_OFFLOAD
-				new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
-#else
-				new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-#endif
-				if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
-				{
-					ERROR("tx buffer full (ack)");
-				}
-				else
-				{
-#ifdef COUNT_ALL_PACKETS
-					g_total_packet_send++;
-#endif
-				}
+				send_packet(new_tcp_header, packet);
 			}
 			else
 			{
@@ -508,6 +526,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else
 		{
+			g_has_reaction = 0;
 			ERROR("my bad tcp stack implementation(((");
 		}
 	}
@@ -515,12 +534,14 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 	if ((tcp_header->tcp_flags & 0x04) != 0) // RST
 	{
 		TRACE;
+		//not thread safe! only one core used
 		if (rte_hash_del_key(g_clients, key) < 0)
 		{
 			ERROR("can't delete key");
 		}
 		else
 		{
+			g_has_reaction = 1;
 			rte_mempool_put(g_tcp_state_pool, state);
 		}
 	}
@@ -541,26 +562,13 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				// !@#$ the last ack
 			}
 
-#ifdef ENABLE_CSUM_OFFLOAD
-			new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
-#else
-			new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
-#endif
-			if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
-			{
-				ERROR("tx buffer full (finack)");
-			}
-			else
-			{
-#ifdef COUNT_ALL_PACKETS
-				g_total_packet_send++;
-#endif
-			}
+			send_packet(new_tcp_header, packet);
 		}
 		else
 		{
 			ERROR("rte_pktmbuf_alloc, tcp fin ack");
 		}
+		//not thread safe! only one core used
 		if (rte_hash_del_key(g_clients, key) < 0)
 		{
 			ERROR("can't delete key");
@@ -568,8 +576,43 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		else
 		{
 			rte_mempool_put(g_tcp_state_pool, state);
+			g_has_reaction = 1;
 		}
 	}
+#ifdef RST_IF_GOES_WRONG
+	if (g_has_reaction == 0)
+	{
+		struct tcp_hdr* new_tcp_header;
+		struct rte_mbuf* packet = build_packet(state, 0, &new_tcp_header);
+		TRACE;
+		if (packet != NULL)
+		{
+			new_tcp_header->rx_win = TX_WINDOW_SIZE;
+			tcp_header->sent_seq = htonl(state->my_seq_sent);
+			tcp_header->recv_ack = htonl(state->remote_seq + data_size);
+			state->my_seq_sent++; //+1 for FIN
+			tcp_header->tcp_flags = 0x11;
+			state->fin_sent = 1;
+
+			send_packet(new_tcp_header, packet);
+		}
+		else
+		{
+			ERROR("rte_pktmbuf_alloc, tcp fin");
+		}
+		//not thread safe! only one core used
+		if (rte_hash_del_key(g_clients, key) < 0)
+		{
+			ERROR("can't delete key");
+		}
+		else
+		{
+			rte_mempool_put(g_tcp_state_pool, state);
+			g_has_reaction = 1;
+		}
+		ERROR("no reaction");
+	}
+#endif
 }
 
 
@@ -635,12 +678,6 @@ static int lcore_hello(__attribute__((unused)) void* arg)
 		for (unsigned j=0; j<packet_count; ++j)
 		{
 			struct rte_mbuf* m = packets[j];
-			/*
-				printf("packet: ");
-				for(int x=0; x<rte_pktmbuf_data_len(m); ++x)
-					printf("%02X ", (uint32_t)(((uint8_t*)eth_header)[x]));
-				printf("\n");
-				*/
 
 			struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
 			if (RTE_ETH_IS_IPV4_HDR(m->packet_type))
