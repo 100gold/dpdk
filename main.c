@@ -26,7 +26,6 @@
 
 #define ENABLE_CSUM_OFFLOAD
 #define COUNT_ALL_PACKETS
-#define RST_IF_GOES_WRONG
 #define KEEPALIVE
 
 #define MAX_PACKETS 2048
@@ -120,9 +119,6 @@ struct tcp_packet_template g_tcp_packet_template;
 #ifdef COUNT_ALL_PACKETS
 uint64_t g_total_packet_send = 0;
 #endif
-#ifdef RST_IF_GOES_WRONG
-int g_has_reaction = 0;
-#endif
 
 
 static void dump_mbuf(struct rte_mbuf* m)
@@ -184,10 +180,6 @@ static void send_packet(struct tcp_hdr* tcp_header, struct rte_mbuf* packet)
 		g_total_packet_send++;
 #endif
 	}
-
-#ifdef RST_IF_GOES_WRONG
-	g_has_reaction = 1;
-#endif
 }
 
 
@@ -487,9 +479,6 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else if (ack_delta <= my_max_ack_delta)
 		{
-#ifdef RST_IF_GOES_WRONG
-			g_has_reaction = 1;
-#endif
 			state->my_seq_start += ack_delta;
 		}
 		else
@@ -526,7 +515,6 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else
 		{
-			g_has_reaction = 0;
 			ERROR("my bad tcp stack implementation(((");
 		}
 	}
@@ -541,7 +529,6 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else
 		{
-			g_has_reaction = 1;
 			rte_mempool_put(g_tcp_state_pool, state);
 		}
 	}
@@ -576,43 +563,8 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		else
 		{
 			rte_mempool_put(g_tcp_state_pool, state);
-			g_has_reaction = 1;
 		}
 	}
-#ifdef RST_IF_GOES_WRONG
-	if (g_has_reaction == 0)
-	{
-		struct tcp_hdr* new_tcp_header;
-		struct rte_mbuf* packet = build_packet(state, 0, &new_tcp_header);
-		TRACE;
-		if (packet != NULL)
-		{
-			new_tcp_header->rx_win = TX_WINDOW_SIZE;
-			tcp_header->sent_seq = htonl(state->my_seq_sent);
-			tcp_header->recv_ack = htonl(state->remote_seq + data_size);
-			state->my_seq_sent++; //+1 for FIN
-			tcp_header->tcp_flags = 0x11;
-			state->fin_sent = 1;
-
-			send_packet(new_tcp_header, packet);
-		}
-		else
-		{
-			ERROR("rte_pktmbuf_alloc, tcp fin");
-		}
-		//not thread safe! only one core used
-		if (rte_hash_del_key(g_clients, key) < 0)
-		{
-			ERROR("can't delete key");
-		}
-		else
-		{
-			rte_mempool_put(g_tcp_state_pool, state);
-			g_has_reaction = 1;
-		}
-		ERROR("no reaction");
-	}
-#endif
 }
 
 
