@@ -24,6 +24,8 @@
 #include <rte_mempool.h>
 
 
+#define ENABLE_CSUM_OFFLOAD
+
 #define MAX_PACKETS 2048
 #define RXTX_QUEUE_COUNT 8
 #define MY_IP_ADDRESS 0x0a041eac
@@ -131,8 +133,13 @@ static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, 
 	*tcp_header= (struct tcp_hdr*)(packet_start + sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
 
 	ip->total_length = htons(sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr) + data_size);
-	// need to offload
+#ifdef ENABLE_CSUM_OFFLOAD
+	m->l2_len = sizeof(struct ether_hdr);
+	m->l3_len = sizeof(struct ipv4_hdr);
+	m->ol_flags |= PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_TCP_CKSUM;
+#else
 	ip->hdr_checksum = rte_ipv4_cksum(ip);
+#endif
 
 	return m;
 }
@@ -292,8 +299,11 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 						new_data += http->request_url_size;
 						memcpy(new_data, g_http_part3, g_http_part3_size);
 
-						// need to offload
+#ifdef ENABLE_CSUM_OFFLOAD
+						tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
+#else
 						tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
+#endif
 						if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 						{
 							ERROR("tx buffer full (http body)");
@@ -396,8 +406,11 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 					memcpy((uint8_t*)new_tcp_header + sizeof(struct tcp_hdr), options, 12);
 					new_tcp_header->data_off = 0x80;
 
-					// need to offload
+#ifdef ENABLE_CSUM_OFFLOAD
+					new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
+#else
 					new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
+#endif
 					if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 					{
 						ERROR("tx buffer full (synack)");
@@ -466,8 +479,11 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				new_tcp_header->sent_seq = htonl(state->my_seq_sent);
 				new_tcp_header->recv_ack = htonl(state->remote_seq);
 
-				// need to offload
+#ifdef ENABLE_CSUM_OFFLOAD
+				new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
+#else
 				new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
+#endif
 				if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 				{
 					ERROR("tx buffer full (ack)");
@@ -517,8 +533,11 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				// !@#$ the last ack
 			}
 
-			// need to offload
+#ifdef ENABLE_CSUM_OFFLOAD
+			new_tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
+#else
 			new_tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)new_tcp_header-sizeof(struct ipv4_hdr)), new_tcp_header);
+#endif
 			if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
 			{
 				ERROR("tx buffer full (finack)");
@@ -811,6 +830,7 @@ int main(int argc, char** argv)
 		},
 		.txmode = {
 			.mq_mode = ETH_MQ_TX_NONE,
+			.offloads = DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_TCP_CKSUM,
 		},
 	};
 	ret = rte_eth_dev_configure(0, RXTX_QUEUE_COUNT, RXTX_QUEUE_COUNT, &port_conf);
@@ -836,15 +856,18 @@ int main(int argc, char** argv)
 	g_tcp_packet_template.ip.fragment_offset = 0x40; //Don't fragment
 	g_tcp_packet_template.ip.time_to_live = 128;
 	g_tcp_packet_template.ip.next_proto_id = 6;
-	g_tcp_packet_template.ip.hdr_checksum = 0; // how to offload??
+	g_tcp_packet_template.ip.hdr_checksum = 0;
 	g_tcp_packet_template.ip.src_addr = MY_IP_ADDRESS;
 
 	g_tcp_packet_template.tcp.src_port = 0x5000;
-	g_tcp_packet_template.tcp.cksum = 0; // how to offload??
+	g_tcp_packet_template.tcp.cksum = 0;
 	g_tcp_packet_template.tcp.data_off = 0x50; // no options
 	g_tcp_packet_template.tcp.tcp_flags = 0x10; // ACK flag
 
 	fflush(stdout);
+	struct rte_eth_txconf txconf = {
+		.offloads = port_conf.txmode.offloads,
+	};
 	for (uint16_t j=0; j<RXTX_QUEUE_COUNT; ++j)
 	{
 		ret = rte_eth_rx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
@@ -852,7 +875,7 @@ int main(int argc, char** argv)
 		{
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
 		}
-		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL);
+		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), &txconf);
 		if (ret < 0)
 		{
 			rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
