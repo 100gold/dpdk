@@ -86,6 +86,9 @@ struct http_state
 	int state;
 	char request_url[MAX_URL_SIZE+1];
 	size_t request_url_size;
+
+	char last_message[1024];
+	size_t last_message_size;
 };
 
 struct tcp_state
@@ -342,6 +345,9 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 						new_data += http->request_url_size;
 						memcpy(new_data, g_http_part3, g_http_part3_size);
 
+						memcpy(&http->last_message, (char*)tcp_header+sizeof(struct tcp_hdr), total_data_size);
+						http->last_message_size = total_data_size;
+
 						send_packet(tcp_header, packet);
 					}
 					else
@@ -515,7 +521,23 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		}
 		else
 		{
-			ERROR("my bad tcp stack implementation(((");
+			struct tcp_hdr* new_tcp_header;
+			struct rte_mbuf* packet = build_packet(state, state->http.last_message_size, &new_tcp_header);
+			TRACE;
+			if (packet != NULL)
+			{
+				new_tcp_header->rx_win = TX_WINDOW_SIZE;
+				new_tcp_header->sent_seq = htonl(state->my_seq_sent - state->http.last_message_size);
+				new_tcp_header->recv_ack = htonl(state->remote_seq);
+				memcpy((char*)new_tcp_header+sizeof(struct tcp_hdr), &state->http.last_message, state->http.last_message_size);
+
+				send_packet(new_tcp_header, packet);
+			}
+			else
+			{
+				ERROR("rte_pktmbuf_alloc, tcp fin ack");
+			}
+			//ERROR("my bad tcp stack implementation(((");
 		}
 	}
 
@@ -615,12 +637,12 @@ static int lcore_hello(__attribute__((unused)) void* arg)
 		unsigned packet_count = rte_eth_rx_burst(0, (++rx_current_queue) % RXTX_QUEUE_COUNT, packets, MAX_PACKETS);
 #ifdef COUNT_ALL_PACKETS
 		total_packet_read += packet_count;
-		if (last_statistic_read_print + 20000 < total_packet_read)
+		if (last_statistic_read_print + 200000 < total_packet_read)
 		{
 			printf("total packets read: %lu\n", total_packet_read);
 			last_statistic_read_print = total_packet_read;
 		}
-		if (last_statistic_send_print + 20000 < g_total_packet_send)
+		if (last_statistic_send_print + 200000 < g_total_packet_send)
 		{
 			printf("total packets send: %lu\n", g_total_packet_send);
 			last_statistic_send_print = g_total_packet_send;
