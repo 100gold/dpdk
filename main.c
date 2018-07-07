@@ -843,7 +843,9 @@ int main(int argc, char** argv)
 		},
 		.txmode = {
 			.mq_mode = ETH_MQ_TX_NONE,
+#ifdef ENABLE_CSUM_OFFLOAD
 			.offloads = DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_TCP_CKSUM,
+#endif
 		},
 	};
 	ret = rte_eth_dev_configure(0, RXTX_QUEUE_COUNT, RXTX_QUEUE_COUNT, &port_conf);
@@ -878,9 +880,11 @@ int main(int argc, char** argv)
 	g_tcp_packet_template.tcp.tcp_flags = 0x10; // ACK flag
 
 	fflush(stdout);
+#ifdef ENABLE_CSUM_OFFLOAD
 	struct rte_eth_txconf txconf = {
 		.offloads = port_conf.txmode.offloads,
 	};
+#endif
 	for (uint16_t j=0; j<RXTX_QUEUE_COUNT; ++j)
 	{
 		ret = rte_eth_rx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
@@ -888,7 +892,11 @@ int main(int argc, char** argv)
 		{
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
 		}
+#ifdef ENABLE_CSUM_OFFLOAD
 		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), &txconf);
+#else
+		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL);
+#endif
 		if (ret < 0)
 		{
 			rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
