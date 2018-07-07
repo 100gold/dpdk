@@ -25,6 +25,7 @@
 
 
 #define ENABLE_CSUM_OFFLOAD
+#define COUNT_ALL_PACKETS
 
 #define MAX_PACKETS 2048
 #define RXTX_QUEUE_COUNT 8
@@ -111,8 +112,9 @@ struct rte_mempool* g_tcp_state_pool = NULL;
 struct ether_addr g_mac_addr;
 struct rte_hash* g_clients = NULL;
 struct tcp_packet_template g_tcp_packet_template;
-
+#ifdef COUNT_ALL_PACKETS
 uint64_t g_total_packet_send = 0;
+#endif
 
 
 static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, struct tcp_hdr** tcp_header)
@@ -310,7 +312,9 @@ static void feed_http(void* data, size_t data_size, struct tcp_state* state)
 						}
 						else
 						{
+#ifdef COUNT_ALL_PACKETS
 							g_total_packet_send++;
+#endif
 						}
 					}
 					else
@@ -417,7 +421,9 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 					}
 					else
 					{
+#ifdef COUNT_ALL_PACKETS
 						g_total_packet_send++;
+#endif
 					}
 				}
 				else
@@ -445,7 +451,7 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 		uint32_t my_max_ack_delta = state->my_seq_sent - state->my_seq_start;
 		if (ack_delta == 0)
 		{
-			if (data_size == 0)
+			if ((data_size == 0) && (tcp_header->tcp_flags == 0x10))
 			{
 				ERROR("need to retransmit. not supported");
 			}
@@ -490,7 +496,9 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 				}
 				else
 				{
+#ifdef COUNT_ALL_PACKETS
 					g_total_packet_send++;
+#endif
 				}
 			}
 			else
@@ -544,7 +552,9 @@ static void process_tcp(struct rte_mbuf* m, struct tcp_hdr* tcp_header, struct t
 			}
 			else
 			{
+#ifdef COUNT_ALL_PACKETS
 				g_total_packet_send++;
+#endif
 			}
 		}
 		else
@@ -599,14 +609,16 @@ static void send_arp_response(const struct arp* arp_in)
 static int lcore_hello(__attribute__((unused)) void* arg)
 {
 	struct rte_mbuf *packets[MAX_PACKETS];
+	uint16_t rx_current_queue = 0;
+#ifdef COUNT_ALL_PACKETS
 	uint64_t last_statistic_send_print = 0;
 	uint64_t last_statistic_read_print = 0;
 	uint64_t total_packet_read = 0;
-	uint16_t rx_current_queue = 0;
+#endif
 	while (1)
 	{
 		unsigned packet_count = rte_eth_rx_burst(0, (++rx_current_queue) % RXTX_QUEUE_COUNT, packets, MAX_PACKETS);
-
+#ifdef COUNT_ALL_PACKETS
 		total_packet_read += packet_count;
 		if (last_statistic_read_print + 20000 < total_packet_read)
 		{
@@ -618,6 +630,7 @@ static int lcore_hello(__attribute__((unused)) void* arg)
 			printf("total packets send: %lu\n", g_total_packet_send);
 			last_statistic_send_print = g_total_packet_send;
 		}
+#endif
 
 		for (unsigned j=0; j<packet_count; ++j)
 		{
@@ -788,7 +801,7 @@ int main(int argc, char** argv)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 	}
 
-	g_tcp_state_pool = rte_mempool_create("tcp_state_pool", 131071, sizeof(struct tcp_state),
+	g_tcp_state_pool = rte_mempool_create("tcp_state_pool", 65535, sizeof(struct tcp_state),
 		0, 0, NULL, NULL, NULL, NULL, rte_socket_id(), 0);
 	if (g_tcp_state_pool == NULL)
 	{
@@ -881,7 +894,6 @@ int main(int argc, char** argv)
 			rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d\n", ret);
 		}
 	}
-	rte_eth_promiscuous_enable(0);
 
 	ret = rte_eth_dev_start(0);
 	if (ret < 0)
