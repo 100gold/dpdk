@@ -27,7 +27,7 @@
 // enable offloading will reduce performance on ec2
 //#define ENABLE_IP_CSUM_OFFLOAD
 //#define ENABLE_TCP_CSUM_OFFLOAD
-#define COUNT_ALL_PACKETS
+//#define COUNT_ALL_PACKETS
 #define KEEPALIVE
 
 #define MAX_PACKETS 2048
