@@ -29,7 +29,8 @@
 #define KEEPALIVE
 
 #define MAX_PACKETS 2048
-#define RXTX_QUEUE_COUNT 8
+#define RX_QUEUE_COUNT 1
+#define TX_QUEUE_COUNT 8
 #define MY_IP_ADDRESS 0x0a041eac
 #define TX_WINDOW_SIZE 0x7fff
 
@@ -173,7 +174,7 @@ static void send_packet(struct tcp_hdr* tcp_header, struct rte_mbuf* packet)
 #else
 	tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
 #endif
-	if (rte_eth_tx_burst(0, (++g_tx_current_queue) % RXTX_QUEUE_COUNT, &packet, 1) != 1)
+	if (rte_eth_tx_burst(0, (++g_tx_current_queue) % TX_QUEUE_COUNT, &packet, 1) != 1)
 	{
 		ERROR("tx buffer full");
 	}
@@ -634,7 +635,7 @@ static int lcore_hello(__attribute__((unused)) void* arg)
 #endif
 	while (1)
 	{
-		unsigned packet_count = rte_eth_rx_burst(0, (++rx_current_queue) % RXTX_QUEUE_COUNT, packets, MAX_PACKETS);
+		unsigned packet_count = rte_eth_rx_burst(0, (++rx_current_queue) % RX_QUEUE_COUNT, packets, MAX_PACKETS);
 #ifdef COUNT_ALL_PACKETS
 		total_packet_read += packet_count;
 		if (last_statistic_read_print + 200000 < total_packet_read)
@@ -859,7 +860,7 @@ int main(int argc, char** argv)
 #endif
 		},
 	};
-	ret = rte_eth_dev_configure(0, RXTX_QUEUE_COUNT, RXTX_QUEUE_COUNT, &port_conf);
+	ret = rte_eth_dev_configure(0, RX_QUEUE_COUNT, TX_QUEUE_COUNT, &port_conf);
 	if (ret < 0)
 	{
 		rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d\n", ret);
@@ -891,18 +892,21 @@ int main(int argc, char** argv)
 	g_tcp_packet_template.tcp.tcp_flags = 0x10; // ACK flag
 
 	fflush(stdout);
-#ifdef ENABLE_CSUM_OFFLOAD
-	struct rte_eth_txconf txconf = {
-		.offloads = port_conf.txmode.offloads,
-	};
-#endif
-	for (uint16_t j=0; j<RXTX_QUEUE_COUNT; ++j)
+	for (uint16_t j=0; j<RX_QUEUE_COUNT; ++j)
 	{
 		ret = rte_eth_rx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), NULL, g_packet_mbuf_pool);
 		if (ret < 0)
 		{
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d\n", ret);
 		}
+	}
+#ifdef ENABLE_CSUM_OFFLOAD
+	struct rte_eth_txconf txconf = {
+		.offloads = port_conf.txmode.offloads,
+	};
+#endif
+	for (uint16_t j=0; j<TX_QUEUE_COUNT; ++j)
+	{
 #ifdef ENABLE_CSUM_OFFLOAD
 		ret = rte_eth_tx_queue_setup(0, j, 1024, rte_eth_dev_socket_id(0), &txconf);
 #else
