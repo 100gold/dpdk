@@ -24,12 +24,14 @@
 #include <rte_mempool.h>
 
 
-#define ENABLE_CSUM_OFFLOAD
+// enable offloading will reduce performance on ec2
+//#define ENABLE_IP_CSUM_OFFLOAD
+//#define ENABLE_TCP_CSUM_OFFLOAD
 #define COUNT_ALL_PACKETS
 #define KEEPALIVE
 
 #define MAX_PACKETS 2048
-#define RX_QUEUE_COUNT 1
+#define RX_QUEUE_COUNT 8
 #define TX_QUEUE_COUNT 8
 #define MY_IP_ADDRESS 0x0a041eac
 #define TX_WINDOW_SIZE 0x7fff
@@ -38,6 +40,14 @@
 //#define TRACE printf("trace at %s:%i\n", __FUNCTION__, __LINE__);
 #define TRACE ;
 //#define ERROR(_S_) ;
+
+#ifdef ENABLE_IP_CSUM_OFFLOAD
+#define ENABLE_CSUM_OFFLOAD
+#else
+#ifdef ENABLE_TCP_CSUM_OFFLOAD
+#define ENABLE_CSUM_OFFLOAD
+#endif
+#endif
 
 
 #pragma pack(push)
@@ -158,7 +168,10 @@ static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, 
 #ifdef ENABLE_CSUM_OFFLOAD
 	m->l2_len = sizeof(struct ether_hdr);
 	m->l3_len = sizeof(struct ipv4_hdr);
-	m->ol_flags |= PKT_TX_IPV4 | PKT_TX_IP_CKSUM | PKT_TX_TCP_CKSUM;
+	m->ol_flags |= PKT_TX_IPV4;
+#endif
+#ifdef ENABLE_IP_CSUM_OFFLOAD
+	m->ol_flags |= PKT_TX_IP_CKSUM;
 #else
 	ip->hdr_checksum = rte_ipv4_cksum(ip);
 #endif
@@ -169,7 +182,8 @@ static struct rte_mbuf* build_packet(struct tcp_state* state, size_t data_size, 
 
 static void send_packet(struct tcp_hdr* tcp_header, struct rte_mbuf* packet)
 {
-#ifdef ENABLE_CSUM_OFFLOAD
+#ifdef ENABLE_TCP_CSUM_OFFLOAD
+	packet->ol_flags |=  PKT_TX_TCP_CKSUM;
 	tcp_header->cksum = rte_ipv4_phdr_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), packet->ol_flags);
 #else
 	tcp_header->cksum = rte_ipv4_udptcp_cksum((struct ipv4_hdr*)((char*)tcp_header-sizeof(struct ipv4_hdr)), tcp_header);
@@ -844,7 +858,7 @@ int main(int argc, char** argv)
 		rte_exit(EXIT_FAILURE, "Not implemented. Too much ports\n");
 	}
 
-	const struct rte_eth_conf port_conf = {
+	struct rte_eth_conf port_conf = {
 		.rxmode = {
 			.split_hdr_size = 0,
 			.header_split   = 0, /**< Header Split disabled */
@@ -855,11 +869,14 @@ int main(int argc, char** argv)
 		},
 		.txmode = {
 			.mq_mode = ETH_MQ_TX_NONE,
-#ifdef ENABLE_CSUM_OFFLOAD
-			.offloads = DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_TCP_CKSUM,
-#endif
 		},
 	};
+#ifdef ENABLE_IP_CSUM_OFFLOAD
+	port_conf.txmode.offloads |= DEV_TX_OFFLOAD_IPV4_CKSUM;
+#endif
+#ifdef ENABLE_TCP_CSUM_OFFLOAD
+	port_conf.txmode.offloads |= DEV_TX_OFFLOAD_TCP_CKSUM;
+#endif
 	ret = rte_eth_dev_configure(0, RX_QUEUE_COUNT, TX_QUEUE_COUNT, &port_conf);
 	if (ret < 0)
 	{
